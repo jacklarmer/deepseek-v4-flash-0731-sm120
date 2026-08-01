@@ -1,0 +1,71 @@
+# DeepSeek-V4-Flash-0731 + DSpark on 4x RTX PRO 6000 Blackwell (SM120).
+#
+# This uses the community "Gilded Gnosis" r16 release image, whose launcher lives
+# inside the image and is configured entirely through environment variables.
+# Run `DRY_RUN=1` to print the exact `vllm serve` command it will build.
+#
+# The upstream example targets 2 GPUs (TP2). This file targets 4 (TP4). See
+# TUNING.md for the measured comparison and the full knob surface.
+services:
+  ds4:
+    image: ${IMAGE}
+    container_name: ${NAME:-ds4-0731}
+    entrypoint: ["/usr/local/bin/serve-ds4-flash.sh"]
+    network_mode: host
+    ipc: host
+    privileged: true
+    init: true
+    shm_size: 32gb
+    gpus: all
+    restart: unless-stopped
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile: { soft: 1048576, hard: 1048576 }
+      stack: 67108864
+    environment:
+      CUDA_VISIBLE_DEVICES: ${GPUS:-0,1,2,3}
+      PORT: ${PORT:-8000}
+
+      # Serving mode and kernel selection
+      MODE: ${MODE:-dspark}
+      BACKEND: ${BACKEND:-b12x-a8}          # b12x-a16 | b12x-a8 | b12x-a8-dglin | lucifer-default | lucifer-cutlass
+      TP_SIZE: ${TP_SIZE:-4}
+      DCP_SIZE: 1                            # DSpark requires DCP=1; do not raise
+
+      # Collective path. On a PCIe-only host with P2P disabled, `b12x` enables
+      # SparkInfer's PCIe all-reduce and explicitly forbids the custom CUDA-P2P
+      # all-reduce that deadlocks this topology. `nccl` is the conservative
+      # fallback and adds --disable-custom-all-reduce.
+      ALLREDUCE_MODE: ${ALLREDUCE_MODE:-b12x}
+
+      # Speculative decoding. num_speculative_tokens must be >= 5: the fused
+      # DSpark draft head has block size 5 and lower values are rejected during
+      # config validation.
+      DSPARK_DEPTH_MODE: ${DSPARK_DEPTH_MODE:-fixed}
+      DSPARK_TOKENS: ${DSPARK_TOKENS:-5}
+      DRAFT_SAMPLE_METHOD: ${DRAFT_SAMPLE_METHOD:-probabilistic}
+
+      MAX_NUM_SEQS: ${MAX_NUM_SEQS:-16}
+      MAX_MODEL_LEN: ${MAX_MODEL_LEN:-262144}
+      MAX_NUM_BATCHED_TOKENS: ${MAX_NUM_BATCHED_TOKENS:-8192}
+      GPU_MEMORY_UTILIZATION: ${GPU_MEMORY_UTILIZATION:-0.95}
+
+      LOAD_FORMAT: ${LOAD_FORMAT:-instanttensor}
+      INSTANTTENSOR_BACKEND: ${INSTANTTENSOR_BACKEND:-BUFFERED}
+
+      # Native CPU KV offload, in GiB across all TP ranks. 0 disables.
+      # Independent of LMCache; qualify them separately, never together.
+      KV_OFFLOADING_SIZE: ${KV_OFFLOADING_SIZE:-0}
+
+      DSPARK_MODEL: /model
+      VLLM_API_KEY: ${VLLM_API_KEY:?set VLLM_API_KEY from a protected key file, never inline}
+      VLLM_NO_USAGE_STATS: "1"
+
+      # Escape hatch for anything the launcher does not expose.
+      # Add --no-enable-prefix-caching here when benchmarking.
+      EXTRA_VLLM_ARGS: ${EXTRA_VLLM_ARGS:-}
+
+    volumes:
+      - ${MODEL_ROOT}:/model:ro
+      - ${JIT_CACHE:-./cache}:/cache
+      - ${JIT_CACHE:-./cache}/tmp:/container-tmp

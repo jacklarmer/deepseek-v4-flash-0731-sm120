@@ -1,0 +1,7 @@
+.env
+cache/
+runs/
+*.log
+*.jsonl
+lmx-run.json
+hardware.json
