@@ -4,8 +4,16 @@
 `deepseek-ai/DeepSeek-V4-Flash-0731` (official weights, MXFP4 experts + FP8 block
 attention/dense), DSpark speculative decoding at K5, SparkInfer/B12X MoE backend.
 
-Prefix caching **disabled** for all measurements. Token counts come from streamed
-`usage`, never SSE chunk counts.
+Token counts come from streamed `usage`, never SSE chunk counts.
+
+> **Correction (2026-08-01).** An earlier revision of this file said prefix caching
+> was disabled for all measurements. That was wrong. vLLM V1 enables prefix caching
+> by default and `--no-enable-prefix-caching` was never passed; the server reports a
+> 73–78% hit rate. The decode numbers below are unaffected — every timed prompt is
+> 24–85 tokens and `--block-size` is 256, so no prompt ever completes a single
+> cacheable block. This was verified directly: the same code prompt repeated scores
+> 508.8, and with a unique nonce per call scores 513.0, a 9 ms spread. The
+> **prefill** numbers are a different story — see below.
 
 ---
 
@@ -30,6 +38,42 @@ tok/s ≈ (verification steps/s) × (1 + accepted draft tokens per step)
 
 Draft acceptance is far higher on deterministic code than on open-ended prose.
 Benchmark the workload you actually run, and always report which one you used.
+
+---
+
+## "Prefill tok/s" on leaderboards is not a throughput measurement
+
+It is a derived ratio: **`promptTokens ÷ TTFT`**. Confirmed to the decimal against
+two published entries from this server (25 tok / 51.01 ms → 490.1; 85 tok /
+137.36 ms → 618.8).
+
+Because TTFT has a fixed floor of roughly 40–50 ms on this stack (HTTP round trip,
+tokenization, scheduler admission, first forward, speculative draft head), the ratio
+scales almost linearly with prompt length until the prompt is large enough to
+dominate that floor. Same server, same config, only the prompt changed:
+
+| Prompt tokens | Prefill tok/s, prefix cache warm | Prefill tok/s, **cache-busted** |
+|---:|---:|---:|
+| 24 | 508.8 | 513.0 |
+| 273 | 4,934.8 | 1,755.8 |
+| 802 | 16,401.0 | 5,753.5 |
+| 2,113 | 15,326.2 | 10,652.6 |
+| 8,392 | 58,745.3 | 11,226.4 |
+| 33,485 | 180,455.7 | **11,269.4** |
+
+Two things fall out of this.
+
+**The cached column is meaningless as a hardware measure.** 180,455 tok/s on a 304B
+MoE would require roughly 11 PFLOPS of FP8, several times what four of these cards
+can physically deliver. It is measuring cache lookups. The cache-busted column
+converges to a stable **~11,200 tok/s**, which is physically coherent and is the
+honest sustained prefill figure for this box. A published TP2 measurement of the
+same model independently reports ~10.6k tok/s, which corroborates it.
+
+**Never compare prefill figures across entries without knowing prompt length and
+cache state.** A 24-token prompt and a 33k-token prompt on identical hardware differ
+by 778× on the warm path. Report prompt length alongside any prefill number, and say
+whether the cache was warm.
 
 ---
 
@@ -99,16 +143,27 @@ not a win.
 ## Published to LocalMaxxing
 
 Measured with the `lmx` harness (2 warmups, 5 timed iterations, median) rather than
-the harness above, so the numbers are comparable to other board entries. lmx uses a
-short prose prompt, which is the low-acceptance regime — hence the gap from the
-code figures.
+the harness above, so the numbers are comparable to other board entries.
 
-| Metric | Value |
-|---|---:|
-| tokSOut | 225.0 |
-| tokSPrefill | 490.1 |
-| tokSTotal | 231.3 |
-| ttftMs | 51.01 |
+Two entries from the same server, same configuration, **differing only in the
+prompt**. `lmx benchmark run` accepts `--prompt` for remote endpoints (unlike
+`--temperature`, which applies only to eval-shard runs):
+
+| Metric | Default lmx prompt | Code-generation prompt |
+|---|---:|---:|
+| promptTokens | 25 | 85 |
+| tokSOut | 225.0 | **345.8** |
+| tokSPrefill | 490.1 | 618.8 |
+| tokSTotal | 231.3 | 369.6 |
+| ttftMs | 51.01 | 137.36 |
+
+The 345.8 figure lands within 0.4 tok/s of the independent codebench measurement of
+345.4 — two unrelated harnesses agreeing that closely is good evidence neither is
+measuring an artifact. Both submissions carry an explicit disclosure of which prompt
+produced them.
+
+Note that neither `tokSPrefill` figure is a hardware capability number; both are
+overhead-dominated at these prompt lengths. See the prefill section above.
 
 Submitted as `quantization: FP8` to match how the rest of the board files this
 checkpoint. An earlier submission of the same server used `MXFP4` — technically
